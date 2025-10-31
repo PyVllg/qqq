@@ -1,688 +1,609 @@
-import pygame
-import random
-import os
-import sys
-import json
+"""
+hard_fps.py — Raycasting FPS (Wolfenstein-style) на pygame
+- Без звука
+- Включает: движение, бег, прицел, оружие, стрельбу, враги (AI), аптечки, патроны, HUD
+- Опционально использует изображения из папки images/
+"""
+
+import pygame, math, os, random, sys, json, time
 from collections import deque
 
-# -------------------- Конфигурация --------------------
-WIDTH, HEIGHT = 1024, 640
+# ========== Настройки ==========
+WIDTH, HEIGHT = 1280, 720
 FPS = 60
 
+FOV = math.pi / 3  # 60 градусов
+NUM_RAYS = 240     # чем больше — тем лучше "графика", но медленнее
+MAX_DEPTH = 20
+MAP_SCALE = 64     # один блок в пикселях (на миникарте)
+PLAYER_SPEED = 3.2
+PLAYER_SPRINT_MULT = 1.7
+PLAYER_ROT_SPEED = 0.045
+BULLET_SPEED = 30
+ENEMY_SPEED = 1.1
+
 IMG_DIR = os.path.join(os.path.dirname(__file__), "images")
-SCORES_FILE = os.path.join(os.path.dirname(__file__), "scores.json")
+SCORES_FILE = os.path.join(os.path.dirname(__file__), "fps_scores.json")
 
-# Игровые параметры (можно менять в настройках)
-START_SPAWN_INTERVAL = 900  # мс
-MIN_SPAWN_INTERVAL = 120
-DIFFICULTY_RAMP_MS = 9000
-ENEMY_BASE_SPEED = 2.8
-
-# -------------------- Утилиты --------------------
+# ========== Утилиты ==========
 def load_image(name, size=None):
     path = os.path.join(IMG_DIR, name)
     if os.path.isfile(path):
-        img = pygame.image.load(path).convert_alpha()
+        im = pygame.image.load(path).convert_alpha()
         if size:
-            img = pygame.transform.smoothscale(img, size)
-        return img
+            im = pygame.transform.smoothscale(im, size)
+        return im
     return None
 
-def clamp(n, a, b):
-    return max(a, min(b, n))
-
-def draw_text(surf, text, x, y, font, color=(255,255,255)):
-    surf.blit(font.render(text, True, color), (x, y))
-
-def load_scores():
+def save_score(score):
+    scores = []
     try:
         if os.path.isfile(SCORES_FILE):
-            with open(SCORES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(SCORES_FILE, 'r', encoding='utf-8') as f:
+                scores = json.load(f)
     except Exception:
-        pass
-    return []
-
-def save_score(name, score):
-    scores = load_scores()
-    scores.append({"name": name, "score": score})
-    scores = sorted(scores, key=lambda s: s["score"], reverse=True)[:20]
-    with open(SCORES_FILE, "w", encoding="utf-8") as f:
+        scores = []
+    scores.append({"score": score, "time": int(time.time())})
+    scores = sorted(scores, key=lambda x: x["score"], reverse=True)[:20]
+    with open(SCORES_FILE, 'w', encoding='utf-8') as f:
         json.dump(scores, f, ensure_ascii=False, indent=2)
 
-# -------------------- Pygame init --------------------
+# ========== Инициализация ==========
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("ULTRA HARD — Dodger X")
+pygame.display.set_caption("HARD FPS — Raycaster")
 clock = pygame.time.Clock()
+font = pygame.font.SysFont("consolas", 18)
+bigfont = pygame.font.SysFont("consolas", 42)
 
-# Fonts
-FONT = pygame.font.SysFont("consolas", 20)
-BIG_FONT = pygame.font.SysFont("consolas", 48)
-SMALL_FONT = pygame.font.SysFont("consolas", 16)
-
-# Load optional images
-PLAYER1_IMG = load_image("player1.png", (56,56))
-PLAYER2_IMG = load_image("player2.png", (56,56))
-ENEMY_IMG = load_image("enemy.png", (46,46))
-BOSS_IMG = load_image("boss.png", (140,140))
-BULLET_IMG = load_image("bullet.png", (10,18))
+# ========== Текстуры (опционально) ==========
+WALL1 = load_image("wall1.png", (MAP_SCALE, MAP_SCALE))
+WALL2 = load_image("wall2.png", (MAP_SCALE, MAP_SCALE))
+ENEMY_IMG = load_image("enemy.png", (96, 96))
+WEAPON_IMG = load_image("weapon.png", (420, 280))
+ITEM_HEALTH_IMG = load_image("item_health.png", (32, 32))
 BG_IMG = load_image("bg.png", (WIDTH, HEIGHT))
-POWER_SHIELD_IMG = load_image("power_shield.png", (28,28))
 
-# -------------------- Entities --------------------
-class Entity(pygame.sprite.Sprite):
-    def __init__(self, image=None, rect=None):
-        super().__init__()
-        if image:
-            self.image = image
-        elif rect:
-            self.image = pygame.Surface(rect.size, pygame.SRCALPHA)
-        else:
-            self.image = pygame.Surface((40,40), pygame.SRCALPHA)
-        self.rect = self.image.get_rect()
-    def update(self, *args):
-        pass
+# если текстур нет — подготовим генераторы
+def gen_wall_surface(color):
+    surf = pygame.Surface((MAP_SCALE, MAP_SCALE))
+    surf.fill((20, 20, 20))
+    pygame.draw.rect(surf, color, (4,4,MAP_SCALE-8,MAP_SCALE-8))
+    for i in range(0, MAP_SCALE, 8):
+        pygame.draw.line(surf, (0,0,0), (i,0),(i,MAP_SCALE),1)
+        pygame.draw.line(surf, (0,0,0), (0,i),(MAP_SCALE,i),1)
+    return surf
 
-class Player(Entity):
-    def __init__(self, x, y, color=(200,30,30), controls=None, img=None):
-        img = img or PLAYER1_IMG
-        if img:
-            super().__init__(image=img)
-        else:
-            surf = pygame.Surface((48,48), pygame.SRCALPHA)
-            pygame.draw.polygon(surf, color, [(24,0),(48,48),(0,48)])
-            super().__init__(image=surf)
-        self.rect.center = (x,y)
-        self.speed = 6.5
-        self.controls = controls or {}
-        self.shoot_delay = 180  # ms
-        self.last_shot = 0
-        self.hp = 5
-        self.max_hp = 5
-        self.shield = 0
+if not WALL1:
+    WALL1 = gen_wall_surface((200,80,80))
+if not WALL2:
+    WALL2 = gen_wall_surface((120,120,200))
+if not ENEMY_IMG:
+    # simple enemy sprite
+    e = pygame.Surface((96,96), pygame.SRCALPHA)
+    pygame.draw.circle(e, (190,30,30), (48,48), 44)
+    pygame.draw.circle(e, (0,0,0), (36,36), 6)
+    pygame.draw.circle(e, (0,0,0), (60,36), 6)
+    pygame.draw.rect(e, (0,0,0), (30,62,36,10))
+    ENEMY_IMG = e
+if not WEAPON_IMG:
+    w = pygame.Surface((420,280), pygame.SRCALPHA)
+    pygame.draw.rect(w, (40,40,40), (80,140,260,80), border_radius=12)
+    pygame.draw.rect(w, (160,160,160), (100,150,220,60), border_radius=6)
+    WEAPON_IMG = w
+if not ITEM_HEALTH_IMG:
+    ih = pygame.Surface((32,32), pygame.SRCALPHA)
+    pygame.draw.rect(ih, (180,20,20), (0,0,32,32), border_radius=6)
+    pygame.draw.rect(ih, (255,255,255), (12,6,8,20))
+    pygame.draw.rect(ih, (255,255,255), (6,12,20,8))
+    ITEM_HEALTH_IMG = ih
+
+# ========== Карта ==========
+# 0 — пустое, 1 — стена тип1, 2 — стена тип2
+MAP = [
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,0,0,0,0,0,0,0,0,2,0,0,0,0,0,1],
+    [1,0,2,0,0,0,1,0,0,2,0,0,1,0,0,1],
+    [1,0,2,0,1,0,1,0,0,0,0,2,1,0,0,1],
+    [1,0,0,0,1,0,0,0,2,0,0,0,0,0,0,1],
+    [1,0,0,0,1,0,0,0,2,0,0,0,0,1,0,1],
+    [1,0,1,0,0,0,0,0,2,0,1,0,0,1,0,1],
+    [1,0,1,1,1,1,1,0,2,0,1,0,0,1,0,1],
+    [1,0,0,0,0,0,0,0,2,0,1,0,0,0,0,1],
+    [1,0,0,0,0,2,0,0,2,0,0,0,2,0,0,1],
+    [1,0,0,0,0,2,0,0,0,0,0,0,2,0,0,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+]
+MAP_W = len(MAP[0])
+MAP_H = len(MAP)
+
+# ========== Игрок ==========
+class Player:
+    def __init__(self, x, y, ang=0.0):
+        self.x = x
+        self.y = y
+        self.angle = ang
+        self.hp = 100
+        self.max_hp = 100
+        self.ammo = 60
         self.score = 0
-        self.bullets = pygame.sprite.Group()
-        self.power_level = 0  # 0-normal, 1-double, 2-triple
-        self.invulnerable_until = 0
+        self.sprint = False
+        self.crouch = False
+        self.kills = 0
 
-    def update(self, keys):
-        dx = dy = 0
-        if keys[self.controls.get("left", pygame.K_LEFT)]:
-            dx -= self.speed
-        if keys[self.controls.get("right", pygame.K_RIGHT)]:
-            dx += self.speed
-        if keys[self.controls.get("up", pygame.K_UP)]:
-            dy -= self.speed
-        if keys[self.controls.get("down", pygame.K_DOWN)]:
-            dy += self.speed
-        self.rect.x += dx
-        self.rect.y += dy
-        self.rect.left = clamp(self.rect.left, 0, WIDTH - self.rect.width)
-        self.rect.top = clamp(self.rect.top, 0, HEIGHT - self.rect.height)
-        # bullets update
-        self.bullets.update()
+player = Player(3.5, 5.5, math.pi/2)
 
-    def can_shoot(self):
-        return pygame.time.get_ticks() - self.last_shot >= self.shoot_delay
-
-    def shoot(self):
-        now = pygame.time.get_ticks()
-        if not self.can_shoot():
-            return
-        self.last_shot = now
-        bx = self.rect.centerx
-        by = self.rect.top
-        shots = []
-        if self.power_level <= 0:
-            shots.append(Bullet(bx, by, -10))
-        elif self.power_level == 1:
-            shots.append(Bullet(bx-10, by, -10))
-            shots.append(Bullet(bx+10, by, -10))
-        else:
-            shots.append(Bullet(bx, by, -10))
-            shots.append(Bullet(bx-18, by, -8))
-            shots.append(Bullet(bx+18, by, -8))
-        for s in shots:
-            self.bullets.add(s)
-
-    def take_damage(self, amount):
-        t = pygame.time.get_ticks()
-        if t < self.invulnerable_until:
-            return False
-        if self.shield > 0:
-            self.shield -= 1
-            self.invulnerable_until = t + 300
-            return True
-        self.hp -= amount
-        self.invulnerable_until = t + 700
-        return True
-
-class Bullet(Entity):
-    def __init__(self, x, y, vy= -8):
-        img = BULLET_IMG
-        if img:
-            super().__init__(image=img)
-        else:
-            surf = pygame.Surface((8,16), pygame.SRCALPHA)
-            pygame.draw.rect(surf, (255,220,40), (0,0,8,16))
-            super().__init__(image=surf)
-        self.rect.center = (x,y)
-        self.vy = vy
-
-    def update(self):
-        self.rect.y += self.vy
-        if self.rect.bottom < 0 or self.rect.top > HEIGHT:
-            self.kill()
-
-class Enemy(Entity):
-    def __init__(self, speed, kind=0):
-        img = ENEMY_IMG
-        if img:
-            super().__init__(image=img)
-        else:
-            surf = pygame.Surface((44,44), pygame.SRCALPHA)
-            pygame.draw.circle(surf, (32,32,200), (22,22), 22)
-            super().__init__(image=surf)
-        self.speed = speed
-        self.rect.x = random.randint(0, WIDTH - self.rect.width)
-        self.rect.y = -self.rect.height - random.randint(0,200)
-        self.vx = random.uniform(-1.6, 1.6)
-        self.kind = kind  # can be used to diversify behavior
-        self.hp = 1 + kind//2
-
-    def update(self):
-        self.rect.y += self.speed
-        self.rect.x += self.vx
-        # bounce at borders
-        if self.rect.left < 0 or self.rect.right > WIDTH:
-            self.vx *= -1
-        if self.rect.top > HEIGHT + 50:
-            self.kill()
-
-class Boss(Entity):
-    def __init__(self):
-        img = BOSS_IMG
-        if img:
-            super().__init__(image=img)
-        else:
-            surf = pygame.Surface((140,140), pygame.SRCALPHA)
-            pygame.draw.rect(surf, (120,10,10), (0,0,140,140), border_radius=16)
-            super().__init__(image=surf)
-        self.rect.center = (WIDTH//2, -80)
-        self.vx = 2.5
-        self.vy = 1.2
-        self.hp = 80
-        self.attack_timer = 0
-        self.attack_interval = 1200
-
-    def update(self):
-        # simple entrance then roaming
-        if self.rect.top < 50:
-            self.rect.y += 2.2
-            return
-        self.rect.x += self.vx
-        if self.rect.left <= 0 or self.rect.right >= WIDTH:
-            self.vx *= -1
-
-        # slight sin movement could be added
-        self.attack_timer += clock.get_time()
-
-    def attack_ready(self):
-        if self.attack_timer >= self.attack_interval:
-            self.attack_timer = 0
-            return True
-        return False
-
-# Power-ups
-class PowerUp(Entity):
-    TYPES = ["hp", "shield", "power", "slow"]
-    def __init__(self, kind=None):
-        self.kind = kind or random.choice(PowerUp.TYPES)
-        surf = pygame.Surface((28,28), pygame.SRCALPHA)
-        if POWER_SHIELD_IMG:
-            super().__init__(image=POWER_SHIELD_IMG)
-        else:
-            color = (255,200,50) if self.kind == "power" else (50,200,50)
-            pygame.draw.circle(surf, color, (14,14), 14)
-            super().__init__(image=surf)
-        self.rect.x = random.randint(20, WIDTH-40)
-        self.rect.y = -20
-        self.vy = 2.6
-
-    def update(self):
-        self.rect.y += self.vy
-        if self.rect.top > HEIGHT + 10:
-            self.kill()
-
-# Simple particle for visual feedback (optional)
-class Particle(Entity):
-    def __init__(self, x, y, vx, vy, life=500):
-        surf = pygame.Surface((4,4), pygame.SRCALPHA)
-        pygame.draw.circle(surf, (255,180,60), (2,2), 2)
-        super().__init__(image=surf)
-        self.rect.center = (x,y)
-        self.vx = vx
-        self.vy = vy
-        self.life = life
-        self.birth = pygame.time.get_ticks()
-    def update(self):
-        self.rect.x += self.vx
-        self.rect.y += self.vy
-        if pygame.time.get_ticks() - self.birth > self.life:
-            self.kill()
-
-# -------------------- Game Manager --------------------
-class Game:
-    def __init__(self):
-        # state
-        self.running = True
-        self.mode = "menu"
-        self.players = pygame.sprite.Group()
-        self.enemies = pygame.sprite.Group()
-        self.enemy_spawn_timer = 0
-        self.spawn_interval = START_SPAWN_INTERVAL
-        self.last_difficulty = pygame.time.get_ticks()
-        self.enemy_speed_min = ENEMY_BASE_SPEED
-        self.enemy_speed_max = ENEMY_BASE_SPEED + 2.2
-        self.particles = pygame.sprite.Group()
-        self.powerups = pygame.sprite.Group()
-        self.boss = None
-        self.wave = 1
-        self.wave_time = 0
-        self.hard_mods = {"bullet_hell": False, "dense_waves": False}
-        self.two_player = False
-        self.mode_type = "survival"  # survival / campaign
-        self.scoreboard = load_scores()
-        self.settings = {"difficulty": "hard"}  # easy/normal/hard/ultra
-        # menu pointer
-        self.menu_index = 0
-
-    def reset(self, two_player=False):
-        self.players.empty()
-        self.enemies.empty()
-        self.particles.empty()
-        self.powerups.empty()
-        self.boss = None
-        self.spawn_interval = START_SPAWN_INTERVAL
-        self.enemy_speed_min = ENEMY_BASE_SPEED
-        self.enemy_speed_max = ENEMY_BASE_SPEED + 2.2
-        self.enemy_spawn_timer = 0
-        self.last_difficulty = pygame.time.get_ticks()
-        self.wave = 1
-        self.wave_time = 0
-        self.two_player = two_player
-
-        # create player(s)
-        p1_controls = {"left": pygame.K_a, "right": pygame.K_d, "up": pygame.K_w, "down": pygame.K_s, "shoot": pygame.K_SPACE}
-        p2_controls = {"left": pygame.K_LEFT, "right": pygame.K_RIGHT, "up": pygame.K_UP, "down": pygame.K_DOWN, "shoot": pygame.K_RCTRL}
-        p1 = Player(WIDTH//2, HEIGHT-120, color=(200,40,40), controls=p1_controls, img=PLAYER1_IMG)
-        self.players.add(p1)
-        if two_player:
-            p2 = Player(WIDTH//2 + 80, HEIGHT-120, color=(40,120,200), controls=p2_controls, img=PLAYER2_IMG)
-            self.players.add(p2)
-
-    def spawn_enemy(self):
-        speed = random.uniform(self.enemy_speed_min, self.enemy_speed_max)
-        kind = 0
-        # occasionally spawn stronger enemies
-        if random.random() < 0.12:
-            kind = random.choice([1,2])
-        e = Enemy(speed, kind=kind)
-        self.enemies.add(e)
-
-    def spawn_powerup(self):
-        if random.random() < 0.06:
-            self.powerups.add(PowerUp())
-
-    def update_difficulty(self):
-        now = pygame.time.get_ticks()
-        if now - self.last_difficulty >= DIFFICULTY_RAMP_MS:
-            self.last_difficulty = now
-            self.spawn_interval = max(MIN_SPAWN_INTERVAL, int(self.spawn_interval * 0.86))
-            self.enemy_speed_min += 0.35
-            self.enemy_speed_max += 0.6
-            self.wave += 1
-            # occasionally enable a hard mod
-            if self.wave % 5 == 0 and random.random() < 0.6:
-                self.hard_mods["dense_waves"] = True if random.random() < 0.5 else self.hard_mods["dense_waves"]
-                self.hard_mods["bullet_hell"] = True if random.random() < 0.35 else self.hard_mods["bullet_hell"]
-
-    def handle_collisions(self):
-        # bullets vs enemies
-        for player in self.players:
-            for b in player.bullets:
-                hits = pygame.sprite.spritecollide(b, self.enemies, False, dokill=False)
-                for h in hits:
-                    h.hp -= 1
-                    b.kill()
-                    # particles
-                    for _ in range(6):
-                        self.particles.add(Particle(b.rect.centerx, b.rect.centery, random.uniform(-2,2), random.uniform(-2,2), life=200+random.randint(0,300)))
-                    if h.hp <= 0:
-                        # award points scaled by kind
-                        pts = 5 + h.kind*4
-                        player.score += pts
-                        h.kill()
-                        if random.random() < 0.08:
-                            self.spawn_powerup()
-            # player bullets cleanup handled in bullet.update()
-
-        # enemies vs players
-        for player in self.players:
-            hits = pygame.sprite.spritecollide(player, self.enemies, True)
-            for h in hits:
-                player.take_damage(1)
-                # visual
-                for _ in range(8):
-                    self.particles.add(Particle(h.rect.centerx, h.rect.centery, random.uniform(-3,3), random.uniform(-3,3), life=400))
-            # collect powerups
-            p_hits = pygame.sprite.spritecollide(player, self.powerups, True)
-            for p in p_hits:
-                if p.kind == "hp":
-                    player.hp = min(player.max_hp, player.hp + 1)
-                elif p.kind == "shield":
-                    player.shield += 1
-                elif p.kind == "power":
-                    player.power_level = min(2, player.power_level + 1)
-                    # temporarily reduce shoot delay
-                    player.shoot_delay = max(90, player.shoot_delay - 30)
-                elif p.kind == "slow":
-                    # slow enemies for a moment - implement as reducing their speed
-                    for e in self.enemies:
-                        e.speed *= 0.68
-                # particle
-                for _ in range(10):
-                    self.particles.add(Particle(p.rect.centerx, p.rect.centery, random.uniform(-3,3), random.uniform(-3,3), life=350))
-
-        # bullets vs boss and boss attacks
-        if self.boss:
-            for player in self.players:
-                for b in player.bullets:
-                    if self.boss.rect.colliderect(b.rect):
-                        self.boss.hp -= 1
-                        b.kill()
-                        if self.boss.hp <= 0:
-                            # boss defeated, reward
-                            player.score += 500
-                            self.boss.kill()
-                            self.boss = None
-                            # big particles burst
-                            for _ in range(60):
-                                self.particles.add(Particle(self.boss.rect.centerx, self.boss.rect.centery, random.uniform(-5,5), random.uniform(-5,5), life=800))
+# ========== Враги ==========
+class Enemy:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.hp = 40
+        self.alive = True
+        self.last_move = 0
+        self.move_interval = 600 + random.randint(0,400)  # ms
+        self.aggro = False
 
     def update(self, dt):
-        keys = pygame.key.get_pressed()
-        # update players
-        for p in self.players:
-            p.update(keys)
-            # shooting
-            if keys[p.controls.get("shoot", pygame.K_SPACE)]:
-                p.shoot()
-
-        # spawn logic
-        self.enemy_spawn_timer += dt
-        if self.enemy_spawn_timer >= self.spawn_interval:
-            self.enemy_spawn_timer = 0
-            # spawn multiple if dense waves
-            n = 1
-            if self.hard_mods["dense_waves"]:
-                n += random.randint(0,2)
-            for _ in range(n):
-                self.spawn_enemy()
-
-        # periodic powerups spawn
-        if random.random() < 0.01:
-            self.spawn_powerup()
-
-        # update entities
-        self.enemies.update()
-        self.powerups.update()
-        self.particles.update()
-        # bullets are already updated by players
-
-        # boss spawning: every 7 waves spawn a boss
-        if self.wave % 7 == 0 and self.boss is None and len(self.enemies) == 0 and random.random() < 0.006:
-            self.boss = Boss()
-        if self.boss:
-            self.boss.update()
-            # boss attacks: spawn projectiles or enemies
-            if self.boss.attack_ready():
-                # spawn a set of enemies or bullets
-                for i in range(10 if self.hard_mods["bullet_hell"] else 6):
-                    e = Enemy(random.uniform(2.8,5.0), kind=random.choice([1,2]))
-                    e.rect.centerx = clamp(self.boss.rect.centerx + random.randint(-160,160), 40, WIDTH-40)
-                    e.rect.y = self.boss.rect.bottom + 10
-                    e.vx = random.uniform(-2.2, 2.2)
-                    e.speed = random.uniform(2.6, 5.2)
-                    self.enemies.add(e)
-
-        # collisions
-        self.handle_collisions()
-
-        # remove dead players? if all dead -> game over
-        all_dead = True
-        for p in self.players:
-            if p.hp > 0:
-                all_dead = False
-        if all_dead:
-            self.mode = "game_over"
-            # compile score: sum of players
-            total_score = sum(p.score for p in self.players)
-            self.final_score = total_score
-
-        # difficulty ramp
-        self.update_difficulty()
-        self.wave_time += dt
-
-    def render_hud(self, surf):
-        y = 8
-        x = 8
-        for i, p in enumerate(self.players):
-            draw_text(surf, f"P{i+1} Score: {p.score}", x, y + i*80, FONT)
-            draw_text(surf, f"HP: {p.hp}/{p.max_hp}  Shield: {p.shield}  Power: {p.power_level}", x, y+22 + i*80, SMALL_FONT)
-            # health bar
-            pygame.draw.rect(surf, (100,100,100), (x, y+42 + i*80, 180, 10))
-            hpw = int(180 * (p.hp / p.max_hp))
-            pygame.draw.rect(surf, (200,40,40), (x, y+42 + i*80, hpw, 10))
-
-        draw_text(surf, f"Wave: {self.wave}", WIDTH-220, 8, FONT)
-        draw_text(surf, f"Enemies: {len(self.enemies)}", WIDTH-220, 30, FONT)
-        draw_text(surf, f"Spawn interval: {self.spawn_interval}ms", WIDTH-220, 52, SMALL_FONT)
-        # active mods
-        mods = ", ".join([k for k,v in self.hard_mods.items() if v])
-        draw_text(surf, f"Mods: {mods if mods else 'none'}", WIDTH-220, 80, SMALL_FONT)
-
-    def draw(self, surf):
-        # background
-        if BG_IMG:
-            surf.blit(BG_IMG, (0,0))
+        if not self.alive: return
+        # если игрок близко — двигаться к нему
+        dx = player.x - self.x
+        dy = player.y - self.y
+        dist = math.hypot(dx, dy)
+        if dist < 6.5:
+            self.aggro = True
+        if self.aggro:
+            # простая навигация: двигаться по направлению, избегая стен
+            ang = math.atan2(dy, dx)
+            nx = self.x + math.cos(ang) * ENEMY_SPEED * (dt/16.0)
+            ny = self.y + math.sin(ang) * ENEMY_SPEED * (dt/16.0)
+            if not is_blocked(nx, self.y):
+                self.x = nx
+            if not is_blocked(self.x, ny):
+                self.y = ny
         else:
-            surf.fill((10,10,12))
-            # subtle grid
-            for gx in range(0, WIDTH, 48):
-                pygame.draw.line(surf, (8,8,8), (gx,0),(gx,HEIGHT))
-            for gy in range(0, HEIGHT, 48):
-                pygame.draw.line(surf, (8,8,8), (0,gy),(WIDTH,gy))
+            # случайное брожение
+            self.last_move += dt
+            if self.last_move > self.move_interval:
+                self.last_move = 0
+                self.move_interval = 400 + random.randint(0,800)
+                # иногда менять позицию чуть-чуть
+                ang = random.random()*2*math.pi
+                nx = self.x + math.cos(ang) * 0.6
+                ny = self.y + math.sin(ang) * 0.6
+                if not is_blocked(nx, ny):
+                    self.x = nx
+                    self.y = ny
 
-        # draw sprites: enemies, players, bullets, powerups, boss, particles
-        self.enemies.draw(surf)
-        for p in self.players:
-            p.bullets.draw(surf)
-        self.powerups.draw(surf)
-        if self.boss:
-            surf.blit(self.boss.image, self.boss.rect)
-        self.players.draw(surf)
-        self.particles.draw(surf)
+enemies = [Enemy(8.5,3.5), Enemy(10.5,7.5), Enemy(4.5,9.5)]
+
+# ========== Предметы ==========
+items = []  # tuple(kind, x,y)
+# spawn some health
+items.append(("health", 5.2, 4.5))
+items.append(("ammo", 9.5, 4.5))
+items.append(("health", 11.3, 8.6))
+
+# ========== Коллизии ==========
+def is_blocked(x, y):
+    mx = int(x)
+    my = int(y)
+    if mx < 0 or my < 0 or mx >= MAP_W or my >= MAP_H:
+        return True
+    return MAP[my][mx] != 0
+
+# ========== Raycasting ==========
+# returns list of (dist, texture, offset, vertical) for each ray
+def cast_rays(px, py, pa):
+    rays = []
+    half_fov = FOV / 2
+    start_ang = pa - half_fov
+    delta_ang = FOV / NUM_RAYS
+    for ray in range(NUM_RAYS):
+        ang = start_ang + ray * delta_ang
+        # normalize
+        sin_a = math.sin(ang)
+        cos_a = math.cos(ang)
+        # DDA algorithm
+        dist = 0
+        hit = False
+        texture = 1
+        offset = 0
+        vertical = False
+
+        # step a small increments along the ray
+        x = px
+        y = py
+        for depth in range(1, MAX_DEPTH*8):
+            dist = depth * 0.125
+            x = px + cos_a * dist
+            y = py + sin_a * dist
+            if x < 0 or y < 0 or x >= MAP_W or y >= MAP_H:
+                break
+            cell = MAP[int(y)][int(x)]
+            if cell != 0:
+                hit = True
+                texture = cell
+                # compute texture offset:
+                # where the ray hit the wall cell (fractional)
+                offset = (x - int(x)) if (MAP[int(y)][int(x)] != 0) else (y - int(y))
+                # decide vertical/horizontal by comparing fractional parts
+                vertical = abs((x - int(x)) - (y - int(y))) < 0.2
+                break
+        if not hit:
+            dist = MAX_DEPTH
+            texture = 0
+            offset = 0
+        # correct fish-eye
+        ca = ang - pa
+        dist *= math.cos(ca)
+        rays.append((dist, texture, offset, vertical, ang))
+    return rays
+
+# ========== Отрисовка 3D ==========
+def render_3d(surface, rays):
+    half_h = HEIGHT//2
+    wall_h_unit = (MAP_SCALE * 300)  # scaling constant
+    for i, (dist, tex, offset, vertical, ang) in enumerate(rays):
+        if dist <= 0: dist = 0.0001
+        # project wall height
+        h = int(wall_h_unit / (dist * 60.0))
+        if h > 2000: h = 2000
+        # choose texture and column
+        if tex == 1:
+            tex_surf = WALL1
+        elif tex == 2:
+            tex_surf = WALL2
+        else:
+            tex_surf = WALL1
+        # sample column from texture
+        tx = int(offset * (MAP_SCALE-1))  # texture x coordinate
+        col = pygame.Surface((1, MAP_SCALE)).convert_alpha()
+        col.blit(tex_surf, (0,0), (tx,0,1,MAP_SCALE))
+        # scale column to wall height
+        col = pygame.transform.smoothscale(col, (int(WIDTH/NUM_RAYS)+1, h))
+        # shading by distance
+        shade = clamp(255 - int(dist*18), 40, 255)
+        col.fill((shade, shade, shade), special_flags=pygame.BLEND_MULT)
+        # compute vertical position
+        y = half_h - h//2
+        surface.blit(col, (i*(WIDTH/NUM_RAYS), y))
+
+    # floor and ceiling fill
+    pygame.draw.rect(surface, (30,30,30), (0,0,WIDTH, half_h))   # ceiling (dark)
+    pygame.draw.rect(surface, (60,60,60), (0,half_h,WIDTH, half_h))  # floor
+
+# ========== Спрайты врагов (рисуются как billboards) ==========
+def render_sprites(surface, rays):
+    # Build list of visible sprites (enemies)
+    sprites = []
+    for e in enemies:
+        if not e.alive: continue
+        dx = e.x - player.x
+        dy = e.y - player.y
+        dist = math.hypot(dx, dy)
+        ang = math.atan2(dy, dx)
+        # normalize angle difference
+        da = ang - player.angle
+        while da <= -math.pi: da += 2*math.pi
+        while da > math.pi: da -= 2*math.pi
+        if abs(da) > FOV/2 + 0.2:
+            continue
+        # screen projection
+        # find ray index that corresponds to ang
+        rel_ang = da
+        screen_x = (rel_ang + FOV/2) / FOV * WIDTH
+        size = max(10, int((MAP_SCALE * 600) / (dist * 80)))
+        sprites.append((dist, screen_x, size, e))
+    # sort by distance descending
+    sprites.sort(key=lambda s: s[0], reverse=True)
+    for dist, sx, size, e in sprites:
+        img = pygame.transform.smoothscale(ENEMY_IMG, (int(size), int(size)))
+        # shade by distance
+        shade = clamp(255 - int(dist*18), 40, 255)
+        img.fill((shade,shade,shade,0), special_flags=pygame.BLEND_MULT)
+        y = HEIGHT//2 - size//2 + 30
+        surface.blit(img, (sx - size//2, y))
+
+# ========== HUD and weapon ==========
+weapon_img = WEAPON_IMG
+weapon_pos = (WIDTH//2 - weapon_img.get_width()//2, HEIGHT - weapon_img.get_height())
+
+crosshair = pygame.Surface((21,21), pygame.SRCALPHA)
+pygame.draw.line(crosshair, (255,255,255), (10,0),(10,7),2)
+pygame.draw.line(crosshair, (255,255,255), (10,14),(10,20),2)
+pygame.draw.line(crosshair, (255,255,255), (0,10),(7,10),2)
+pygame.draw.line(crosshair, (255,255,255), (14,10),(20,10),2)
+
+bullets = []  # list of dict {x,y,dx,dy,owner}
+
+# ========== Стрельба ==========
+def fire_bullet():
+    if player.ammo <= 0: return
+    player.ammo -= 1
+    ang = player.angle
+    bx = player.x + math.cos(ang) * 0.3
+    by = player.y + math.sin(ang) * 0.3
+    dx = math.cos(ang) * BULLET_SPEED
+    dy = math.sin(ang) * BULLET_SPEED
+    bullets.append({"x": bx, "y": by, "dx": dx, "dy": dy, "life": 120})
+
+# ========== Проверка попадания пули по врагу ==========
+def update_bullets(dt):
+    for b in bullets[:]:
+        # move bullet in world units per tick
+        b["x"] += b["dx"] * (dt/FPS/16.0)
+        b["y"] += b["dy"] * (dt/FPS/16.0)
+        b["life"] -= dt
+        # collision with wall?
+        if is_blocked(b["x"], b["y"]) or b["life"] <= 0:
+            try: bullets.remove(b)
+            except: pass
+            continue
+        # check enemies
+        for e in enemies:
+            if not e.alive: continue
+            dist = math.hypot(e.x - b["x"], e.y - b["y"])
+            if dist < 0.8:
+                e.hp -= 36
+                if e.hp <= 0:
+                    e.alive = False
+                    player.score += 150
+                    player.kills += 1
+                    # drop health sometimes
+                    if random.random() < 0.35:
+                        items.append(("health", e.x, e.y))
+                try: bullets.remove(b)
+                except: pass
+                break
+
+# ========== Интерфейс ==========
+def draw_hud(surface):
+    # health
+    pygame.draw.rect(surface, (0,0,0), (20,20,260,34))
+    pygame.draw.rect(surface, (120,0,0), (24,24, int( (player.hp/player.max_hp)*240 ), 26))
+    draw_text(surface, f"HP: {player.hp}/{player.max_hp}", 28, 26, font, (255,255,255))
+    # ammo and score
+    draw_text(surface, f"Ammo: {player.ammo}", WIDTH-180, 26, font)
+    draw_text(surface, f"Score: {player.score}", WIDTH-350, 26, font)
+    draw_text(surface, f"Kills: {player.kills}", WIDTH-470, 26, font)
+    # crosshair
+    surface.blit(crosshair, (WIDTH//2 - 10, HEIGHT//2 - 10))
+
+# ========== Подбор предметов ==========
+def pickup_items():
+    for it in items[:]:
+        kind, ix, iy = it
+        if math.hypot(player.x - ix, player.y - iy) < 0.8:
+            if kind == "health":
+                player.hp = min(player.max_hp, player.hp + 34)
+            elif kind == "ammo":
+                player.ammo += 30
+            items.remove(it)
+            player.score += 24
+
+# ========== Миникарта ==========
+def draw_minimap(surface):
+    # small top-right map
+    mw = MAP_W * 8
+    mh = MAP_H * 8
+    sx = WIDTH - mw - 12
+    sy = 12
+    pygame.draw.rect(surface, (10,10,10), (sx-4,sy-4,mw+8,mh+8))
+    for y in range(MAP_H):
+        for x in range(MAP_W):
+            color = (190,190,190) if MAP[y][x] != 0 else (20,20,20)
+            pygame.draw.rect(surface, color, (sx + x*8, sy + y*8, 8,8))
+    # player
+    px = sx + int(player.x*8)
+    py = sy + int(player.y*8)
+    pygame.draw.circle(surface, (50,220,50), (px,py), 4)
+    # enemies
+    for e in enemies:
+        if not e.alive: continue
+        ex = sx + int(e.x*8)
+        ey = sy + int(e.y*8)
+        pygame.draw.circle(surface, (220,50,50), (ex,ey), 3)
+    # items
+    for it in items:
+        k,x,y = it
+        ix = sx + int(x*8)
+        iy = sy + int(y*8)
+        pygame.draw.circle(surface, (200,200,50), (ix,iy), 2)
+
+# ========== Основной цикл ==========
+def main():
+    running = True
+    last_time = pygame.time.get_ticks()
+    show_minimap = True
+    fire_cooldown = 0
+    mouse_look = True
+    pygame.event.set_grab(True)
+    pygame.mouse.set_visible(False)
+
+    while running:
+        dt = clock.tick(FPS)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                save_score(player.score)
+                running = False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    save_score(player.score)
+                    running = False
+                if event.key == pygame.K_m:
+                    global_map_toggle = True
+                if event.key == pygame.K_TAB:
+                    nonlocal_show = False
+                if event.key == pygame.K_v:
+                    # toggle minimap
+                    nonlocal_show = False
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    if fire_cooldown <= 0:
+                        fire_bullet()
+                        fire_cooldown = 200  # ms
+                if event.button == 3:
+                    # melee? maybe sprint toggle
+                    pass
+            if event.type == pygame.MOUSEMOTION and mouse_look:
+                mx, my = event.rel
+                player.angle += mx * 0.0025
+
+        # inputs
+        keys = pygame.key.get_pressed()
+        move_speed = PLAYER_SPEED * (PLAYER_SPRINT_MULT if keys[pygame.K_LSHIFT] else 1.0)
+        dx = dy = 0
+        if keys[pygame.K_w]:
+            dx += math.cos(player.angle) * move_speed * (dt/16.0)
+            dy += math.sin(player.angle) * move_speed * (dt/16.0)
+        if keys[pygame.K_s]:
+            dx -= math.cos(player.angle) * move_speed * (dt/16.0)
+            dy -= math.sin(player.angle) * move_speed * (dt/16.0)
+        if keys[pygame.K_a]:
+            dx += math.cos(player.angle - math.pi/2) * move_speed * (dt/16.0)
+            dy += math.sin(player.angle - math.pi/2) * move_speed * (dt/16.0)
+        if keys[pygame.K_d]:
+            dx += math.cos(player.angle + math.pi/2) * move_speed * (dt/16.0)
+            dy += math.sin(player.angle + math.pi/2) * move_speed * (dt/16.0)
+        # collision against walls
+        if not is_blocked(player.x + dx*0.12, player.y):
+            player.x += dx*0.12
+        if not is_blocked(player.x, player.y + dy*0.12):
+            player.y += dy*0.12
+
+        # rotation by keys
+        if keys[pygame.K_LEFT]:
+            player.angle -= PLAYER_ROT_SPEED * (dt/16.0)
+        if keys[pygame.K_RIGHT]:
+            player.angle += PLAYER_ROT_SPEED * (dt/16.0)
+
+        # mouse aiming (optional)
+        mx, my = pygame.mouse.get_pos()
+        # firing by space
+        if keys[pygame.K_SPACE]:
+            if fire_cooldown <= 0:
+                fire_bullet()
+                fire_cooldown = 220
+
+        if fire_cooldown > 0:
+            fire_cooldown -= dt
+
+        # update enemies
+        for e in enemies:
+            e.update(dt)
+
+        # update bullets
+        update_bullets(dt)
+
+        # pickup items
+        pickup_items()
+
+        # check enemy touching player
+        for e in enemies:
+            if e.alive and math.hypot(player.x - e.x, player.y - e.y) < 0.8:
+                # enemy hits player
+                player.hp -= 12
+                # knockback
+                ang = math.atan2(player.y - e.y, player.x - e.x)
+                nx = player.x + math.cos(ang)*0.3
+                ny = player.y + math.sin(ang)*0.3
+                if not is_blocked(nx, ny):
+                    player.x, player.y = nx, ny
+                e.aggro = True
+                if player.hp <= 0:
+                    # game over
+                    save_score(player.score)
+                    game_over(screen)
+                    return
+
+        # rendering
+        if BG_IMG:
+            screen.blit(BG_IMG, (0,0))
+        else:
+            screen.fill((5,5,8))
+
+        # cast rays and render 3d
+        rays = cast_rays(player.x, player.y, player.angle)
+        # ceiling and floor handled inside render_3d: need to draw them before walls? reorder
+        render_3d(screen, rays)
+        render_sprites(screen, rays)
+
+        # draw weapon
+        wp = pygame.transform.smoothscale(weapon_img, (int(weapon_img.get_width()*1.0), int(weapon_img.get_height()*1.0)))
+        # recoil while firing? small jitter
+        rx = 0
+        ry = 0
+        if fire_cooldown > 0:
+            rx = random.randint(-2,2)
+            ry = random.randint(-2,2)
+        screen.blit(wp, (WIDTH - wp.get_width() - 24 + rx, HEIGHT - wp.get_height() - 12 + ry), special_flags=pygame.BLEND_ALPHA_SDL2)
+
+        # draw bullets (as tracer lines)
+        for b in bullets:
+            sx = int((b["x"] - player.x) * MAP_SCALE + WIDTH//2)
+            sy = int((b["y"] - player.y) * MAP_SCALE + HEIGHT//2)
+            # but better draw as small rect near center for now
+            pygame.draw.circle(screen, (255,220,40), (int(WIDTH//2 + (b["x"]-player.x)*40), int(HEIGHT//2 + (b["y"]-player.y)*40)), 2)
+
+        # items icons
+        for it in items:
+            k,x,y = it
+            # world->screen approximate
+            dx = x - player.x; dy = y - player.y
+            dist = math.hypot(dx, dy)
+            ang = math.atan2(dy, dx)
+            da = ang - player.angle
+            while da <= -math.pi: da += 2*math.pi
+            while da > math.pi: da -= 2*math.pi
+            if abs(da) < FOV/2:
+                sx = WIDTH//2 + int(math.tan(da) * WIDTH/2)
+                size = max(8, int( (MAP_SCALE*300)/(dist*70) ))
+                if k == "health":
+                    img = pygame.transform.smoothscale(ITEM_HEALTH_IMG, (size,size))
+                    yy = HEIGHT//2 - size//2 + 40
+                    screen.blit(img, (sx-size//2, yy))
 
         # HUD
-        self.render_hud(surf)
+        draw_hud(screen)
+        if show_minimap:
+            draw_minimap(screen)
 
-    def menu_loop(self):
-        # simple menu: start single, start 2p, scores, quit
-        menu_items = ["Start Survival (1P)", "Start Survival (2P)", "Campaign", "Scores", "Settings", "Quit"]
-        option = 0
-        while self.mode == "menu":
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit(); sys.exit()
-                if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_DOWN:
-                        option = (option + 1) % len(menu_items)
-                    if event.key == pygame.K_UP:
-                        option = (option - 1) % len(menu_items)
-                    if event.key == pygame.K_RETURN:
-                        if menu_items[option] == "Start Survival (1P)":
-                            self.reset(two_player=False)
-                            self.mode = "playing"
-                            return
-                        if menu_items[option] == "Start Survival (2P)":
-                            self.reset(two_player=True)
-                            self.mode = "playing"
-                            return
-                        if menu_items[option] == "Campaign":
-                            self.mode_type = "campaign"
-                            self.reset(two_player=False)
-                            self.mode = "playing"
-                            return
-                        if menu_items[option] == "Scores":
-                            self.mode = "scores"
-                            return
-                        if menu_items[option] == "Settings":
-                            self.mode = "settings"
-                            return
-                        if menu_items[option] == "Quit":
-                            pygame.quit(); sys.exit()
-            # rendering
-            screen.fill((6,6,8))
-            draw_text(screen, "ULTRA HARD — Dodger X", WIDTH//2 - 260, 40, BIG_FONT, (230,80,80))
-            for i, it in enumerate(menu_items):
-                color = (255,255,255) if i == option else (150,150,150)
-                draw_text(screen, it, WIDTH//2 - 140, 170 + i*36, FONT, color)
-            draw_text(screen, "Use ↑/↓ and Enter. Tips: survive, collect power-ups, beat bosses.", WIDTH//2 - 360, HEIGHT - 80, SMALL_FONT, (190,190,190))
-            pygame.display.flip()
-            clock.tick(30)
+        # UI overlays (score etc.)
+        draw_text(screen, "HARD FPS — Twin Raycaster Demo (no sound). Esc to quit. M toggles minimap.", 18, HEIGHT-28, font, (180,180,180))
 
-    def scores_loop(self):
-        while self.mode == "scores":
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit(); sys.exit()
-                if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        self.mode = "menu"
-            screen.fill((10,10,10))
-            draw_text(screen, "Top Scores", WIDTH//2 - 80, 24, BIG_FONT)
-            scores = load_scores()
-            for i, s in enumerate(scores[:15]):
-                draw_text(screen, f"{i+1}. {s['name'][:10]:<10}  {s['score']}", WIDTH//2 - 200, 100 + i*26, FONT)
-            draw_text(screen, "Press Esc to return", WIDTH//2 - 100, HEIGHT - 40, SMALL_FONT)
-            pygame.display.flip()
-            clock.tick(30)
+        pygame.display.flip()
 
-    def settings_loop(self):
-        opts = ["Difficulty: easy / normal / hard / ultra", "Toggle Bullet Hell Mod", "Back"]
-        sel = 0
-        while self.mode == "settings":
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit(); sys.exit()
-                if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_DOWN:
-                        sel = (sel + 1) % len(opts)
-                    if event.key == pygame.K_UP:
-                        sel = (sel - 1) % len(opts)
-                    if event.key == pygame.K_RETURN:
-                        if opts[sel].startswith("Difficulty"):
-                            # cycle difficulties
-                            order = ["easy", "normal", "hard", "ultra"]
-                            cur = self.settings.get("difficulty", "hard")
-                            nxt = order[(order.index(cur) + 1) % len(order)]
-                            self.settings["difficulty"] = nxt
-                        elif opts[sel].startswith("Toggle Bullet Hell"):
-                            self.hard_mods["bullet_hell"] = not self.hard_mods["bullet_hell"]
-                        else:
-                            self.mode = "menu"
-                    if event.key == pygame.K_ESCAPE:
-                        self.mode = "menu"
-            # render
-            screen.fill((8,8,8))
-            draw_text(screen, "Settings", WIDTH//2 - 60, 28, BIG_FONT)
-            draw_text(screen, f"Difficulty: {self.settings.get('difficulty')}", WIDTH//2 - 160, 120, FONT)
-            draw_text(screen, f"Bullet Hell Mod: {'ON' if self.hard_mods['bullet_hell'] else 'OFF'}", WIDTH//2 - 160, 160, FONT)
-            draw_text(screen, "Use ↑/↓ and Enter to change, Esc to return", WIDTH//2 - 260, HEIGHT - 40, SMALL_FONT)
-            pygame.display.flip()
-            clock.tick(30)
+    pygame.quit()
+    sys.exit()
 
-    def game_over_loop(self):
-        # show final score and ask name for scoreboard
-        name = "PLAYER"
-        input_active = True
-        cursor = True
-        cursor_timer = 0
-        while self.mode == "game_over":
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit(); sys.exit()
-                if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_RETURN:
-                        # save and go to scores
-                        save_score(name, getattr(self, "final_score", 0))
-                        self.mode = "scores"
-                    elif event.key == pygame.K_BACKSPACE:
-                        name = name[:-1]
-                    else:
-                        if len(name) < 12 and event.unicode.isprintable():
-                            name += event.unicode
-                    if event.key == pygame.K_ESCAPE:
-                        self.mode = "menu"
-            # render
-            screen.fill((10,10,10))
-            draw_text(screen, "GAME OVER", WIDTH//2 - 120, 40, BIG_FONT, (220,40,40))
-            draw_text(screen, f"Score: {getattr(self, 'final_score', 0)}", WIDTH//2 - 60, 120, FONT)
-            draw_text(screen, "Enter name to save score:", WIDTH//2 - 150, 180, FONT)
-            # input box
-            pygame.draw.rect(screen, (40,40,40), (WIDTH//2 - 120, 220, 260, 36))
-            draw_text(screen, name + ("|" if cursor else ""), WIDTH//2 - 110, 226, FONT)
-            cursor_timer += clock.get_time()
-            if cursor_timer > 500:
-                cursor = not cursor
-                cursor_timer = 0
-            draw_text(screen, "Press Enter to save, Esc to back to menu", WIDTH//2 - 210, HEIGHT - 40, SMALL_FONT)
-            pygame.display.flip()
-            clock.tick(30)
+# ========== Game Over screen ==========
+def game_over(surface):
+    t0 = pygame.time.get_ticks()
+    stuck = True
+    while stuck:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
+                    stuck = False
+        surface.fill((8,8,8))
+        draw_text(surface, "YOU DIED", WIDTH//2 - 100, HEIGHT//2 - 60, bigfont, (220,40,40))
+        draw_text(surface, f"Score: {player.score}", WIDTH//2 - 80, HEIGHT//2, font)
+        draw_text(surface, "Press Enter to exit", WIDTH//2 - 120, HEIGHT//2 + 60, font)
+        pygame.display.flip()
+        clock.tick(20)
 
-    def run(self):
-        while self.running:
-            dt = clock.tick(FPS)
-            if self.mode == "menu":
-                self.menu_loop()
-            elif self.mode == "scores":
-                self.scores_loop()
-            elif self.mode == "settings":
-                self.settings_loop()
-            elif self.mode == "playing":
-                # normal playing tick
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        pygame.quit(); sys.exit()
-                    if event.type == pygame.KEYDOWN:
-                        if event.key == pygame.K_ESCAPE:
-                            # pause menu
-                            self.mode = "menu"
-                self.update(dt)
-                self.draw(screen)
-                pygame.display.flip()
-            elif self.mode == "game_over":
-                self.game_over_loop()
-            else:
-                self.mode = "menu"
+# ========== Вспомогательные ==========
+def draw_text(surface, text, x, y, fnt, color=(255,255,255)):
+    surface.blit(fnt.render(text, True, color), (x,y))
 
-# -------------------- main --------------------
-def main():
-    game = Game()
-    game.mode = "menu"
-    game.run()
-
+# ========== Запуск ==========
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        pygame.quit()
+        print("Error:", e)
+        raise
