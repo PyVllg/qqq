@@ -1,0 +1,609 @@
+"""
+hard_fps.py — Raycasting FPS (Wolfenstein-style) на pygame
+- Без звука
+- Включает: движение, бег, прицел, оружие, стрельбу, враги (AI), аптечки, патроны, HUD
+- Опционально использует изображения из папки images/
+"""
+
+import pygame, math, os, random, sys, json, time
+from collections import deque
+
+# ========== Настройки ==========
+WIDTH, HEIGHT = 1280, 720
+FPS = 60
+
+FOV = math.pi / 3  # 60 градусов
+NUM_RAYS = 240     # чем больше — тем лучше "графика", но медленнее
+MAX_DEPTH = 20
+MAP_SCALE = 64     # один блок в пикселях (на миникарте)
+PLAYER_SPEED = 3.2
+PLAYER_SPRINT_MULT = 1.7
+PLAYER_ROT_SPEED = 0.045
+BULLET_SPEED = 30
+ENEMY_SPEED = 1.1
+
+IMG_DIR = os.path.join(os.path.dirname(__file__), "images")
+SCORES_FILE = os.path.join(os.path.dirname(__file__), "fps_scores.json")
+
+# ========== Утилиты ==========
+def load_image(name, size=None):
+    path = os.path.join(IMG_DIR, name)
+    if os.path.isfile(path):
+        im = pygame.image.load(path).convert_alpha()
+        if size:
+            im = pygame.transform.smoothscale(im, size)
+        return im
+    return None
+
+def save_score(score):
+    scores = []
+    try:
+        if os.path.isfile(SCORES_FILE):
+            with open(SCORES_FILE, 'r', encoding='utf-8') as f:
+                scores = json.load(f)
+    except Exception:
+        scores = []
+    scores.append({"score": score, "time": int(time.time())})
+    scores = sorted(scores, key=lambda x: x["score"], reverse=True)[:20]
+    with open(SCORES_FILE, 'w', encoding='utf-8') as f:
+        json.dump(scores, f, ensure_ascii=False, indent=2)
+
+# ========== Инициализация ==========
+pygame.init()
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("HARD FPS — Raycaster")
+clock = pygame.time.Clock()
+font = pygame.font.SysFont("consolas", 18)
+bigfont = pygame.font.SysFont("consolas", 42)
+
+# ========== Текстуры (опционально) ==========
+WALL1 = load_image("wall1.png", (MAP_SCALE, MAP_SCALE))
+WALL2 = load_image("wall2.png", (MAP_SCALE, MAP_SCALE))
+ENEMY_IMG = load_image("enemy.png", (96, 96))
+WEAPON_IMG = load_image("weapon.png", (420, 280))
+ITEM_HEALTH_IMG = load_image("item_health.png", (32, 32))
+BG_IMG = load_image("bg.png", (WIDTH, HEIGHT))
+
+# если текстур нет — подготовим генераторы
+def gen_wall_surface(color):
+    surf = pygame.Surface((MAP_SCALE, MAP_SCALE))
+    surf.fill((20, 20, 20))
+    pygame.draw.rect(surf, color, (4,4,MAP_SCALE-8,MAP_SCALE-8))
+    for i in range(0, MAP_SCALE, 8):
+        pygame.draw.line(surf, (0,0,0), (i,0),(i,MAP_SCALE),1)
+        pygame.draw.line(surf, (0,0,0), (0,i),(MAP_SCALE,i),1)
+    return surf
+
+if not WALL1:
+    WALL1 = gen_wall_surface((200,80,80))
+if not WALL2:
+    WALL2 = gen_wall_surface((120,120,200))
+if not ENEMY_IMG:
+    # simple enemy sprite
+    e = pygame.Surface((96,96), pygame.SRCALPHA)
+    pygame.draw.circle(e, (190,30,30), (48,48), 44)
+    pygame.draw.circle(e, (0,0,0), (36,36), 6)
+    pygame.draw.circle(e, (0,0,0), (60,36), 6)
+    pygame.draw.rect(e, (0,0,0), (30,62,36,10))
+    ENEMY_IMG = e
+if not WEAPON_IMG:
+    w = pygame.Surface((420,280), pygame.SRCALPHA)
+    pygame.draw.rect(w, (40,40,40), (80,140,260,80), border_radius=12)
+    pygame.draw.rect(w, (160,160,160), (100,150,220,60), border_radius=6)
+    WEAPON_IMG = w
+if not ITEM_HEALTH_IMG:
+    ih = pygame.Surface((32,32), pygame.SRCALPHA)
+    pygame.draw.rect(ih, (180,20,20), (0,0,32,32), border_radius=6)
+    pygame.draw.rect(ih, (255,255,255), (12,6,8,20))
+    pygame.draw.rect(ih, (255,255,255), (6,12,20,8))
+    ITEM_HEALTH_IMG = ih
+
+# ========== Карта ==========
+# 0 — пустое, 1 — стена тип1, 2 — стена тип2
+MAP = [
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,0,0,0,0,0,0,0,0,2,0,0,0,0,0,1],
+    [1,0,2,0,0,0,1,0,0,2,0,0,1,0,0,1],
+    [1,0,2,0,1,0,1,0,0,0,0,2,1,0,0,1],
+    [1,0,0,0,1,0,0,0,2,0,0,0,0,0,0,1],
+    [1,0,0,0,1,0,0,0,2,0,0,0,0,1,0,1],
+    [1,0,1,0,0,0,0,0,2,0,1,0,0,1,0,1],
+    [1,0,1,1,1,1,1,0,2,0,1,0,0,1,0,1],
+    [1,0,0,0,0,0,0,0,2,0,1,0,0,0,0,1],
+    [1,0,0,0,0,2,0,0,2,0,0,0,2,0,0,1],
+    [1,0,0,0,0,2,0,0,0,0,0,0,2,0,0,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+]
+MAP_W = len(MAP[0])
+MAP_H = len(MAP)
+
+# ========== Игрок ==========
+class Player:
+    def __init__(self, x, y, ang=0.0):
+        self.x = x
+        self.y = y
+        self.angle = ang
+        self.hp = 100
+        self.max_hp = 100
+        self.ammo = 60
+        self.score = 0
+        self.sprint = False
+        self.crouch = False
+        self.kills = 0
+
+player = Player(3.5, 5.5, math.pi/2)
+
+# ========== Враги ==========
+class Enemy:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.hp = 40
+        self.alive = True
+        self.last_move = 0
+        self.move_interval = 600 + random.randint(0,400)  # ms
+        self.aggro = False
+
+    def update(self, dt):
+        if not self.alive: return
+        # если игрок близко — двигаться к нему
+        dx = player.x - self.x
+        dy = player.y - self.y
+        dist = math.hypot(dx, dy)
+        if dist < 6.5:
+            self.aggro = True
+        if self.aggro:
+            # простая навигация: двигаться по направлению, избегая стен
+            ang = math.atan2(dy, dx)
+            nx = self.x + math.cos(ang) * ENEMY_SPEED * (dt/16.0)
+            ny = self.y + math.sin(ang) * ENEMY_SPEED * (dt/16.0)
+            if not is_blocked(nx, self.y):
+                self.x = nx
+            if not is_blocked(self.x, ny):
+                self.y = ny
+        else:
+            # случайное брожение
+            self.last_move += dt
+            if self.last_move > self.move_interval:
+                self.last_move = 0
+                self.move_interval = 400 + random.randint(0,800)
+                # иногда менять позицию чуть-чуть
+                ang = random.random()*2*math.pi
+                nx = self.x + math.cos(ang) * 0.6
+                ny = self.y + math.sin(ang) * 0.6
+                if not is_blocked(nx, ny):
+                    self.x = nx
+                    self.y = ny
+
+enemies = [Enemy(8.5,3.5), Enemy(10.5,7.5), Enemy(4.5,9.5)]
+
+# ========== Предметы ==========
+items = []  # tuple(kind, x,y)
+# spawn some health
+items.append(("health", 5.2, 4.5))
+items.append(("ammo", 9.5, 4.5))
+items.append(("health", 11.3, 8.6))
+
+# ========== Коллизии ==========
+def is_blocked(x, y):
+    mx = int(x)
+    my = int(y)
+    if mx < 0 or my < 0 or mx >= MAP_W or my >= MAP_H:
+        return True
+    return MAP[my][mx] != 0
+
+# ========== Raycasting ==========
+# returns list of (dist, texture, offset, vertical) for each ray
+def cast_rays(px, py, pa):
+    rays = []
+    half_fov = FOV / 2
+    start_ang = pa - half_fov
+    delta_ang = FOV / NUM_RAYS
+    for ray in range(NUM_RAYS):
+        ang = start_ang + ray * delta_ang
+        # normalize
+        sin_a = math.sin(ang)
+        cos_a = math.cos(ang)
+        # DDA algorithm
+        dist = 0
+        hit = False
+        texture = 1
+        offset = 0
+        vertical = False
+
+        # step a small increments along the ray
+        x = px
+        y = py
+        for depth in range(1, MAX_DEPTH*8):
+            dist = depth * 0.125
+            x = px + cos_a * dist
+            y = py + sin_a * dist
+            if x < 0 or y < 0 or x >= MAP_W or y >= MAP_H:
+                break
+            cell = MAP[int(y)][int(x)]
+            if cell != 0:
+                hit = True
+                texture = cell
+                # compute texture offset:
+                # where the ray hit the wall cell (fractional)
+                offset = (x - int(x)) if (MAP[int(y)][int(x)] != 0) else (y - int(y))
+                # decide vertical/horizontal by comparing fractional parts
+                vertical = abs((x - int(x)) - (y - int(y))) < 0.2
+                break
+        if not hit:
+            dist = MAX_DEPTH
+            texture = 0
+            offset = 0
+        # correct fish-eye
+        ca = ang - pa
+        dist *= math.cos(ca)
+        rays.append((dist, texture, offset, vertical, ang))
+    return rays
+
+# ========== Отрисовка 3D ==========
+def render_3d(surface, rays):
+    half_h = HEIGHT//2
+    wall_h_unit = (MAP_SCALE * 300)  # scaling constant
+    for i, (dist, tex, offset, vertical, ang) in enumerate(rays):
+        if dist <= 0: dist = 0.0001
+        # project wall height
+        h = int(wall_h_unit / (dist * 60.0))
+        if h > 2000: h = 2000
+        # choose texture and column
+        if tex == 1:
+            tex_surf = WALL1
+        elif tex == 2:
+            tex_surf = WALL2
+        else:
+            tex_surf = WALL1
+        # sample column from texture
+        tx = int(offset * (MAP_SCALE-1))  # texture x coordinate
+        col = pygame.Surface((1, MAP_SCALE)).convert_alpha()
+        col.blit(tex_surf, (0,0), (tx,0,1,MAP_SCALE))
+        # scale column to wall height
+        col = pygame.transform.smoothscale(col, (int(WIDTH/NUM_RAYS)+1, h))
+        # shading by distance
+        shade = clamp(255 - int(dist*18), 40, 255)
+        col.fill((shade, shade, shade), special_flags=pygame.BLEND_MULT)
+        # compute vertical position
+        y = half_h - h//2
+        surface.blit(col, (i*(WIDTH/NUM_RAYS), y))
+
+    # floor and ceiling fill
+    pygame.draw.rect(surface, (30,30,30), (0,0,WIDTH, half_h))   # ceiling (dark)
+    pygame.draw.rect(surface, (60,60,60), (0,half_h,WIDTH, half_h))  # floor
+
+# ========== Спрайты врагов (рисуются как billboards) ==========
+def render_sprites(surface, rays):
+    # Build list of visible sprites (enemies)
+    sprites = []
+    for e in enemies:
+        if not e.alive: continue
+        dx = e.x - player.x
+        dy = e.y - player.y
+        dist = math.hypot(dx, dy)
+        ang = math.atan2(dy, dx)
+        # normalize angle difference
+        da = ang - player.angle
+        while da <= -math.pi: da += 2*math.pi
+        while da > math.pi: da -= 2*math.pi
+        if abs(da) > FOV/2 + 0.2:
+            continue
+        # screen projection
+        # find ray index that corresponds to ang
+        rel_ang = da
+        screen_x = (rel_ang + FOV/2) / FOV * WIDTH
+        size = max(10, int((MAP_SCALE * 600) / (dist * 80)))
+        sprites.append((dist, screen_x, size, e))
+    # sort by distance descending
+    sprites.sort(key=lambda s: s[0], reverse=True)
+    for dist, sx, size, e in sprites:
+        img = pygame.transform.smoothscale(ENEMY_IMG, (int(size), int(size)))
+        # shade by distance
+        shade = clamp(255 - int(dist*18), 40, 255)
+        img.fill((shade,shade,shade,0), special_flags=pygame.BLEND_MULT)
+        y = HEIGHT//2 - size//2 + 30
+        surface.blit(img, (sx - size//2, y))
+
+# ========== HUD and weapon ==========
+weapon_img = WEAPON_IMG
+weapon_pos = (WIDTH//2 - weapon_img.get_width()//2, HEIGHT - weapon_img.get_height())
+
+crosshair = pygame.Surface((21,21), pygame.SRCALPHA)
+pygame.draw.line(crosshair, (255,255,255), (10,0),(10,7),2)
+pygame.draw.line(crosshair, (255,255,255), (10,14),(10,20),2)
+pygame.draw.line(crosshair, (255,255,255), (0,10),(7,10),2)
+pygame.draw.line(crosshair, (255,255,255), (14,10),(20,10),2)
+
+bullets = []  # list of dict {x,y,dx,dy,owner}
+
+# ========== Стрельба ==========
+def fire_bullet():
+    if player.ammo <= 0: return
+    player.ammo -= 1
+    ang = player.angle
+    bx = player.x + math.cos(ang) * 0.3
+    by = player.y + math.sin(ang) * 0.3
+    dx = math.cos(ang) * BULLET_SPEED
+    dy = math.sin(ang) * BULLET_SPEED
+    bullets.append({"x": bx, "y": by, "dx": dx, "dy": dy, "life": 120})
+
+# ========== Проверка попадания пули по врагу ==========
+def update_bullets(dt):
+    for b in bullets[:]:
+        # move bullet in world units per tick
+        b["x"] += b["dx"] * (dt/FPS/16.0)
+        b["y"] += b["dy"] * (dt/FPS/16.0)
+        b["life"] -= dt
+        # collision with wall?
+        if is_blocked(b["x"], b["y"]) or b["life"] <= 0:
+            try: bullets.remove(b)
+            except: pass
+            continue
+        # check enemies
+        for e in enemies:
+            if not e.alive: continue
+            dist = math.hypot(e.x - b["x"], e.y - b["y"])
+            if dist < 0.8:
+                e.hp -= 36
+                if e.hp <= 0:
+                    e.alive = False
+                    player.score += 150
+                    player.kills += 1
+                    # drop health sometimes
+                    if random.random() < 0.35:
+                        items.append(("health", e.x, e.y))
+                try: bullets.remove(b)
+                except: pass
+                break
+
+# ========== Интерфейс ==========
+def draw_hud(surface):
+    # health
+    pygame.draw.rect(surface, (0,0,0), (20,20,260,34))
+    pygame.draw.rect(surface, (120,0,0), (24,24, int( (player.hp/player.max_hp)*240 ), 26))
+    draw_text(surface, f"HP: {player.hp}/{player.max_hp}", 28, 26, font, (255,255,255))
+    # ammo and score
+    draw_text(surface, f"Ammo: {player.ammo}", WIDTH-180, 26, font)
+    draw_text(surface, f"Score: {player.score}", WIDTH-350, 26, font)
+    draw_text(surface, f"Kills: {player.kills}", WIDTH-470, 26, font)
+    # crosshair
+    surface.blit(crosshair, (WIDTH//2 - 10, HEIGHT//2 - 10))
+
+# ========== Подбор предметов ==========
+def pickup_items():
+    for it in items[:]:
+        kind, ix, iy = it
+        if math.hypot(player.x - ix, player.y - iy) < 0.8:
+            if kind == "health":
+                player.hp = min(player.max_hp, player.hp + 34)
+            elif kind == "ammo":
+                player.ammo += 30
+            items.remove(it)
+            player.score += 24
+
+# ========== Миникарта ==========
+def draw_minimap(surface):
+    # small top-right map
+    mw = MAP_W * 8
+    mh = MAP_H * 8
+    sx = WIDTH - mw - 12
+    sy = 12
+    pygame.draw.rect(surface, (10,10,10), (sx-4,sy-4,mw+8,mh+8))
+    for y in range(MAP_H):
+        for x in range(MAP_W):
+            color = (190,190,190) if MAP[y][x] != 0 else (20,20,20)
+            pygame.draw.rect(surface, color, (sx + x*8, sy + y*8, 8,8))
+    # player
+    px = sx + int(player.x*8)
+    py = sy + int(player.y*8)
+    pygame.draw.circle(surface, (50,220,50), (px,py), 4)
+    # enemies
+    for e in enemies:
+        if not e.alive: continue
+        ex = sx + int(e.x*8)
+        ey = sy + int(e.y*8)
+        pygame.draw.circle(surface, (220,50,50), (ex,ey), 3)
+    # items
+    for it in items:
+        k,x,y = it
+        ix = sx + int(x*8)
+        iy = sy + int(y*8)
+        pygame.draw.circle(surface, (200,200,50), (ix,iy), 2)
+
+# ========== Основной цикл ==========
+def main():
+    running = True
+    last_time = pygame.time.get_ticks()
+    show_minimap = True
+    fire_cooldown = 0
+    mouse_look = True
+    pygame.event.set_grab(True)
+    pygame.mouse.set_visible(False)
+
+    while running:
+        dt = clock.tick(FPS)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                save_score(player.score)
+                running = False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    save_score(player.score)
+                    running = False
+                if event.key == pygame.K_m:
+                    global_map_toggle = True
+                if event.key == pygame.K_TAB:
+                    nonlocal_show = False
+                if event.key == pygame.K_v:
+                    # toggle minimap
+                    nonlocal_show = False
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    if fire_cooldown <= 0:
+                        fire_bullet()
+                        fire_cooldown = 200  # ms
+                if event.button == 3:
+                    # melee? maybe sprint toggle
+                    pass
+            if event.type == pygame.MOUSEMOTION and mouse_look:
+                mx, my = event.rel
+                player.angle += mx * 0.0025
+
+        # inputs
+        keys = pygame.key.get_pressed()
+        move_speed = PLAYER_SPEED * (PLAYER_SPRINT_MULT if keys[pygame.K_LSHIFT] else 1.0)
+        dx = dy = 0
+        if keys[pygame.K_w]:
+            dx += math.cos(player.angle) * move_speed * (dt/16.0)
+            dy += math.sin(player.angle) * move_speed * (dt/16.0)
+        if keys[pygame.K_s]:
+            dx -= math.cos(player.angle) * move_speed * (dt/16.0)
+            dy -= math.sin(player.angle) * move_speed * (dt/16.0)
+        if keys[pygame.K_a]:
+            dx += math.cos(player.angle - math.pi/2) * move_speed * (dt/16.0)
+            dy += math.sin(player.angle - math.pi/2) * move_speed * (dt/16.0)
+        if keys[pygame.K_d]:
+            dx += math.cos(player.angle + math.pi/2) * move_speed * (dt/16.0)
+            dy += math.sin(player.angle + math.pi/2) * move_speed * (dt/16.0)
+        # collision against walls
+        if not is_blocked(player.x + dx*0.12, player.y):
+            player.x += dx*0.12
+        if not is_blocked(player.x, player.y + dy*0.12):
+            player.y += dy*0.12
+
+        # rotation by keys
+        if keys[pygame.K_LEFT]:
+            player.angle -= PLAYER_ROT_SPEED * (dt/16.0)
+        if keys[pygame.K_RIGHT]:
+            player.angle += PLAYER_ROT_SPEED * (dt/16.0)
+
+        # mouse aiming (optional)
+        mx, my = pygame.mouse.get_pos()
+        # firing by space
+        if keys[pygame.K_SPACE]:
+            if fire_cooldown <= 0:
+                fire_bullet()
+                fire_cooldown = 220
+
+        if fire_cooldown > 0:
+            fire_cooldown -= dt
+
+        # update enemies
+        for e in enemies:
+            e.update(dt)
+
+        # update bullets
+        update_bullets(dt)
+
+        # pickup items
+        pickup_items()
+
+        # check enemy touching player
+        for e in enemies:
+            if e.alive and math.hypot(player.x - e.x, player.y - e.y) < 0.8:
+                # enemy hits player
+                player.hp -= 12
+                # knockback
+                ang = math.atan2(player.y - e.y, player.x - e.x)
+                nx = player.x + math.cos(ang)*0.3
+                ny = player.y + math.sin(ang)*0.3
+                if not is_blocked(nx, ny):
+                    player.x, player.y = nx, ny
+                e.aggro = True
+                if player.hp <= 0:
+                    # game over
+                    save_score(player.score)
+                    game_over(screen)
+                    return
+
+        # rendering
+        if BG_IMG:
+            screen.blit(BG_IMG, (0,0))
+        else:
+            screen.fill((5,5,8))
+
+        # cast rays and render 3d
+        rays = cast_rays(player.x, player.y, player.angle)
+        # ceiling and floor handled inside render_3d: need to draw them before walls? reorder
+        render_3d(screen, rays)
+        render_sprites(screen, rays)
+
+        # draw weapon
+        wp = pygame.transform.smoothscale(weapon_img, (int(weapon_img.get_width()*1.0), int(weapon_img.get_height()*1.0)))
+        # recoil while firing? small jitter
+        rx = 0
+        ry = 0
+        if fire_cooldown > 0:
+            rx = random.randint(-2,2)
+            ry = random.randint(-2,2)
+        screen.blit(wp, (WIDTH - wp.get_width() - 24 + rx, HEIGHT - wp.get_height() - 12 + ry), special_flags=pygame.BLEND_ALPHA_SDL2)
+
+        # draw bullets (as tracer lines)
+        for b in bullets:
+            sx = int((b["x"] - player.x) * MAP_SCALE + WIDTH//2)
+            sy = int((b["y"] - player.y) * MAP_SCALE + HEIGHT//2)
+            # but better draw as small rect near center for now
+            pygame.draw.circle(screen, (255,220,40), (int(WIDTH//2 + (b["x"]-player.x)*40), int(HEIGHT//2 + (b["y"]-player.y)*40)), 2)
+
+        # items icons
+        for it in items:
+            k,x,y = it
+            # world->screen approximate
+            dx = x - player.x; dy = y - player.y
+            dist = math.hypot(dx, dy)
+            ang = math.atan2(dy, dx)
+            da = ang - player.angle
+            while da <= -math.pi: da += 2*math.pi
+            while da > math.pi: da -= 2*math.pi
+            if abs(da) < FOV/2:
+                sx = WIDTH//2 + int(math.tan(da) * WIDTH/2)
+                size = max(8, int( (MAP_SCALE*300)/(dist*70) ))
+                if k == "health":
+                    img = pygame.transform.smoothscale(ITEM_HEALTH_IMG, (size,size))
+                    yy = HEIGHT//2 - size//2 + 40
+                    screen.blit(img, (sx-size//2, yy))
+
+        # HUD
+        draw_hud(screen)
+        if show_minimap:
+            draw_minimap(screen)
+
+        # UI overlays (score etc.)
+        draw_text(screen, "HARD FPS — Twin Raycaster Demo (no sound). Esc to quit. M toggles minimap.", 18, HEIGHT-28, font, (180,180,180))
+
+        pygame.display.flip()
+
+    pygame.quit()
+    sys.exit()
+
+# ========== Game Over screen ==========
+def game_over(surface):
+    t0 = pygame.time.get_ticks()
+    stuck = True
+    while stuck:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
+                    stuck = False
+        surface.fill((8,8,8))
+        draw_text(surface, "YOU DIED", WIDTH//2 - 100, HEIGHT//2 - 60, bigfont, (220,40,40))
+        draw_text(surface, f"Score: {player.score}", WIDTH//2 - 80, HEIGHT//2, font)
+        draw_text(surface, "Press Enter to exit", WIDTH//2 - 120, HEIGHT//2 + 60, font)
+        pygame.display.flip()
+        clock.tick(20)
+
+# ========== Вспомогательные ==========
+def draw_text(surface, text, x, y, fnt, color=(255,255,255)):
+    surface.blit(fnt.render(text, True, color), (x,y))
+
+# ========== Запуск ==========
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        pygame.quit()
+        print("Error:", e)
+        raise
